@@ -1,0 +1,51 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Model weights (large binary files)
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# Compiled CUDA extensions
+*.so
+*.pyd
+*.dll
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Dataset files (large)
+*.npz
+*.h5
+*.hdf5
+
+# Temporary / user files
+tmp_*
+*.tmp
+*.log
+*.pdf
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+venv/
+.venv/
+__pypackages__/
