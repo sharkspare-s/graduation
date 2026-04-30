@@ -47,7 +47,7 @@ class Voxelization(Function):
         M = map_rule.size(0)
         maxActive = map_rule.size(1) - 1
 
-        output_feats = torch.zeros((M, C), dtype=torch.float32, device="cuda")
+        output_feats = torch.cuda.FloatTensor(M, C).zero_()
 
         ctx.for_backwards = (map_rule, mode, maxActive, N)
 
@@ -59,7 +59,7 @@ class Voxelization(Function):
         map_rule, mode, maxActive, N = ctx.for_backwards
         M, C = d_output_feats.size()
 
-        d_feats = torch.zeros((N, C), dtype=torch.float32, device="cuda")
+        d_feats = torch.cuda.FloatTensor(N, C).zero_()
 
         HAIS_OP.voxelize_bp(d_output_feats.contiguous(), d_feats, map_rule, mode, M, maxActive, C)
         return d_feats, None, None
