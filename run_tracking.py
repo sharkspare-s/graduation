@@ -45,6 +45,8 @@ def parse_args():
     # --- data --------------------------------------------------------------
     parser.add_argument("--max-events", default=15000, type=int,
                         help="Cap events per window")
+    parser.add_argument("--target-res", default="346x260", type=str,
+                        help="Model target resolution WxH (events scaled from camera res to this)")
 
     # --- detection thresholds (adaptive) -----------------------------------
     parser.add_argument("--score-thresh-low", default=0.25, type=float,
@@ -146,7 +148,7 @@ def build_evs_norm(events, height, width):
     return np.stack([x_norm, y_norm, t_norm, p], axis=1)
 
 
-def events_to_batch(events, height, width, max_events):
+def events_to_batch(events, height, width, max_events, target_w=346, target_h=260):
     x_raw = events["x"].astype(np.int32)
     y_raw = events["y"].astype(np.int32)
     t_raw = events["t"].astype(np.int64)
@@ -158,6 +160,14 @@ def events_to_batch(events, height, width, max_events):
         x_raw = x_raw[keep]; y_raw = y_raw[keep]
         t_raw = t_raw[keep]; p_raw = p_raw[keep]
 
+    # Scale from camera resolution to model target resolution
+    if width != target_w or height != target_h:
+        x_scaled = np.rint(x_raw.astype(np.float32) * (target_w - 1) / max(width - 1, 1)).astype(np.int32)
+        y_scaled = np.rint(y_raw.astype(np.float32) * (target_h - 1) / max(height - 1, 1)).astype(np.int32)
+    else:
+        x_scaled = x_raw
+        y_scaled = y_raw
+
     t_shift = t_raw - t_raw.min()
     t_max = int(t_shift.max())
     if t_max > 0:
@@ -165,18 +175,19 @@ def events_to_batch(events, height, width, max_events):
     else:
         t_coord = np.zeros_like(t_raw, dtype=np.int32)
 
-    x_coord = np.clip(x_raw, 1, max(1, width - 2))
-    y_coord = np.clip(y_raw, 1, max(1, height - 2))
+    x_coord = np.clip(x_scaled, 1, max(1, target_w - 2))
+    y_coord = np.clip(y_scaled, 1, max(1, target_h - 2))
     t_coord = np.clip(t_coord, 1, 8188)
 
     norm_events = {"x": x_raw.astype(np.int32), "y": y_raw.astype(np.int32),
                    "t": t_raw.astype(np.int64), "p": p_raw}
 
+    # viz_events still uses raw coords (for original-camera overlay)
     viz_events = {"x": x_raw.astype(np.int32), "y": y_raw.astype(np.int32), "p": p_raw}
 
     sample = {
         "ev_loc": np.stack([x_coord, y_coord, t_coord], axis=1),
-        "evs_norm": build_evs_norm(norm_events, height, width),
+        "evs_norm": build_evs_norm(norm_events, target_h, target_w),
         "seg_label": np.zeros(len(x_raw), dtype=np.float32),
         "idx": np.arange(len(x_raw), dtype=np.int64),
     }
@@ -429,7 +440,8 @@ def check_resolution(camera_hw, cfg_res):
 def run_offline_tracking(args, model, tracker, static_filter):
     mv_iterator = EventsIterator(input_path=args.input_path, delta_t=args.window_us)
     height, width = mv_iterator.get_size()
-    check_resolution((height, width), cfg_res=(346, 260))
+    target_w, target_h = (int(x) for x in args.target_res.split("x"))
+    check_resolution((height, width), cfg_res=(target_w, target_h))
 
     blank_score_map = np.zeros((height, width), dtype=np.float32)
     frame_period = 1.0 / max(args.display_fps, 1)
@@ -466,7 +478,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
                     window.show_async(canvas)
                 else:
                     sample, viz_events, x_raw, y_raw = events_to_batch(
-                        events, height, width, args.max_events)
+                        events, height, width, args.max_events, target_w, target_h)
                     should_detect = (
                         frame_idx % max(args.detect_every, 1) == 1
                         or not tracker.visible_tracks(allow_missed=True)
@@ -528,9 +540,10 @@ def main():
     # --- live camera -------------------------------------------------------
     mv_iterator = EventsIterator(input_path=args.input_path, delta_t=args.window_us)
     height, width = mv_iterator.get_size()
-    check_resolution((height, width), cfg_res=cfg.res)
+    target_w, target_h = (int(x) for x in args.target_res.split("x"))
+    check_resolution((height, width), cfg_res=(target_w, target_h))
 
-    print(f"Camera: {width}x{height}  |  window: {args.window_us} us  |  "
+    print(f"Camera: {width}x{height} -> model: {target_w}x{target_h}  |  window: {args.window_us} us  |  "
           f"detect-every: {args.detect_every}  |  max-events: {args.max_events}  |  "
           f"FP16: {args.fp16}  |  debug: {args.debug}")
     print(f"Adaptive threshold: search={args.score_thresh_low}  "
@@ -633,7 +646,7 @@ def main():
                     window.show_async(canvas)
                 else:
                     sample, viz_events, x_raw, y_raw = events_to_batch(
-                        events, height, width, args.max_events)
+                        events, height, width, args.max_events, target_w, target_h)
                     current_viz_events = viz_events
                     should_detect = (
                         frame_idx % max(args.detect_every, 1) == 1
