@@ -412,10 +412,10 @@ def install_stop_keyboard_handler(window, stop_event):
 # Resolution check
 # ---------------------------------------------------------------------------
 
-def check_resolution(camera_hw, config_res):
+def check_resolution(camera_hw, cfg_res):
     """Warn if camera resolution differs from the config the model expects."""
     c_h, c_w = camera_hw
-    cfg_w, cfg_h = config_res
+    cfg_w, cfg_h = cfg_res
     if c_w != cfg_w or c_h != cfg_h:
         print(f"[WARN] Camera resolution ({c_w}x{c_h}) != config res ({cfg_w}x{cfg_h}).")
         print(f"       Events will be clipped to config resolution. "
