@@ -1,9 +1,12 @@
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import Deque, List, Sequence, Tuple
 
 import numpy as np
 
 from tracking.postprocess import Detection
+
+# How many recent positions to remember for static-track detection
+_STATIC_HISTORY_LEN = 8
 
 
 class KalmanFilter:
@@ -17,13 +20,9 @@ class KalmanFilter:
         meas_std: float = 0.12,
     ):
         self.dt = dt
-        # State: [cx, cy, vx, vy]
         self.x = np.zeros((4, 1), dtype=np.float32)
-
-        # Initial covariance
         self.P = np.eye(4, dtype=np.float32) * 0.5
 
-        # State transition (constant velocity)
         self.F = np.array([
             [1, 0, dt, 0],
             [0, 1, 0, dt],
@@ -31,18 +30,15 @@ class KalmanFilter:
             [0, 0, 0, 1],
         ], dtype=np.float32)
 
-        # Measurement matrix (observe position only)
         self.H = np.array([
             [1, 0, 0, 0],
             [0, 1, 0, 0],
         ], dtype=np.float32)
 
-        # Process noise
         q_pos = pos_std ** 2
         q_vel = vel_std ** 2
         self.Q = np.diag([q_pos, q_pos, q_vel, q_vel]).astype(np.float32)
 
-        # Measurement noise
         r = meas_std ** 2
         self.R = np.diag([r, r]).astype(np.float32)
 
@@ -64,9 +60,9 @@ class KalmanFilter:
             return cx, cy
 
         z = np.array([[cx], [cy]], dtype=np.float32)
-        y = z - self.H @ self.x                     # innovation
-        S = self.H @ self.P @ self.H.T + self.R      # innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)     # Kalman gain
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
 
         self.x = self.x + K @ y
         self.P = (np.eye(4, dtype=np.float32) - K @ self.H) @ self.P
@@ -92,6 +88,13 @@ class Track:
     age: int = 1
     hits: int = 1
     missed: int = 0
+    # History of quantised centroids for static-track detection
+    _pos_history: Deque[Tuple[int, int]] = field(default_factory=lambda: Deque(maxlen=_STATIC_HISTORY_LEN))
+
+    @property
+    def avg_score(self) -> float:
+        """Running average score (approximate)."""
+        return self.score  # score is already the latest; use in combination with hits
 
     @property
     def center(self) -> np.ndarray:
@@ -135,6 +138,16 @@ class Track:
         self.hits += 1
         self.missed = 0
 
+        # Record quantised position
+        self._pos_history.append((int(cx) // 4, int(cy) // 4))
+
+    def is_static(self) -> bool:
+        """True if the track has barely moved over the recent history window."""
+        if len(self._pos_history) < 3:
+            return False
+        unique = set(self._pos_history)
+        return len(unique) <= 2
+
     @property
     def confirmed(self) -> bool:
         return self.hits >= 2
@@ -146,10 +159,14 @@ class MultiObjectTracker:
         max_distance: float = 30.0,
         max_missed: int = 8,
         min_hits: int = 2,
+        min_track_score: float = 0.30,
+        static_thresh: int = 4,
     ):
         self.max_distance = max_distance
         self.max_missed = max_missed
         self.min_hits = min_hits
+        self.min_track_score = min_track_score
+        self.static_thresh = static_thresh
         self.next_id = 1
         self.tracks: List[Track] = []
 
@@ -195,12 +212,17 @@ class MultiObjectTracker:
         return matches, sorted(unmatched_tracks), sorted(unmatched_detections)
 
     def _prune_tracks(self) -> None:
-        self.tracks = [t for t in self.tracks if t.missed <= self.max_missed]
+        self.tracks = [
+            t for t in self.tracks
+            if t.missed <= self.max_missed and not t.is_static()
+        ]
 
     def visible_tracks(self, allow_missed: bool = False) -> List[Track]:
         return [
             t for t in self.tracks
-            if t.hits >= self.min_hits and (allow_missed or t.missed == 0)
+            if t.hits >= self.min_hits
+            and (allow_missed or t.missed == 0)
+            and t.score >= self.min_track_score
         ]
 
     def predict_only(self) -> List[Track]:

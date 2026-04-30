@@ -1,8 +1,11 @@
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import Deque, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+# Max history for static-detection filter
+_MAX_STATIC_HISTORY = 32
 
 
 @dataclass
@@ -11,7 +14,17 @@ class Detection:
     center: Tuple[float, float]
     score: float
     area: int
+    # Position fingerprint for hot-pixel suppression (quantised to 4px grid)
+    pos_key: Tuple[int, int] = (0, 0)
 
+    def __post_init__(self):
+        if self.pos_key == (0, 0):
+            self.pos_key = (int(self.center[0]) // 4, int(self.center[1]) // 4)
+
+
+# ---------------------------------------------------------------------------
+# Score-map building
+# ---------------------------------------------------------------------------
 
 def build_score_map(
     x: np.ndarray,
@@ -36,6 +49,60 @@ def build_score_map(
     binary_map[y_sel, x_sel] = 1
     return score_map, binary_map
 
+
+# ---------------------------------------------------------------------------
+# EMA score-map accumulation (weak-target enhancement)
+# ---------------------------------------------------------------------------
+
+def accumulate_score_map(
+    current: np.ndarray,
+    previous: Optional[np.ndarray],
+    ema: float,
+) -> np.ndarray:
+    if previous is None or ema <= 0:
+        return current.copy()
+    return ema * current + (1.0 - ema) * previous
+
+
+# ---------------------------------------------------------------------------
+# Static-detection (hot-pixel) filter
+# ---------------------------------------------------------------------------
+
+class StaticFilter:
+    """Suppress detections whose coarse position stays unchanged for too long."""
+
+    def __init__(self, static_thresh: int = 4):
+        self.static_thresh = static_thresh
+        self._history: Deque[List[Tuple[int, int]]] = Deque(maxlen=_MAX_STATIC_HISTORY)
+
+    def filter(self, detections: List[Detection]) -> List[Detection]:
+        keys = [d.pos_key for d in detections]
+        self._history.append(keys)
+
+        if len(self._history) < self.static_thresh:
+            return detections
+
+        # count consecutive frames where each pos_key appeared
+        count: dict = {}
+        for frame_keys in self._history:
+            seen: set = set()
+            for k in frame_keys:
+                if k not in seen:
+                    count[k] = count.get(k, 0) + 1
+                    seen.add(k)
+
+        return [
+            d for d in detections
+            if count.get(d.pos_key, 0) < self.static_thresh
+        ]
+
+    def reset(self) -> None:
+        self._history.clear()
+
+
+# ---------------------------------------------------------------------------
+# IoU & NMS helpers
+# ---------------------------------------------------------------------------
 
 def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
     ax1, ay1, ax2, ay2 = a
@@ -67,6 +134,22 @@ def _nms_detections(
     return kept
 
 
+# ---------------------------------------------------------------------------
+# Debug heatmap
+# ---------------------------------------------------------------------------
+
+def build_score_heatmap(score_map: np.ndarray) -> np.ndarray:
+    """Convert a float score_map to a BGR heatmap for debug overlay."""
+    v = score_map.copy()
+    v = np.clip(v / max(v.max(), 0.001), 0, 1)
+    v8 = (v * 255).astype(np.uint8)
+    return cv2.applyColorMap(v8, cv2.COLORMAP_JET)
+
+
+# ---------------------------------------------------------------------------
+# Main extraction
+# ---------------------------------------------------------------------------
+
 def extract_detections(
     x: np.ndarray,
     y: np.ndarray,
@@ -82,16 +165,17 @@ def extract_detections(
     max_box_area_ratio: float = 0.15,
     nms_iou: float = 0.3,
     max_detections: int = 10,
+    static_filter: Optional[StaticFilter] = None,
 ) -> Tuple[List[Detection], np.ndarray]:
 
     score_map, binary_map = build_score_map(x, y, scores, height, width, score_thresh)
     if binary_map.max() == 0:
         return [], score_map
 
-    # Morphological close to bridge gaps in fragmented event clusters,
-    # then slight dilation to expand the footprint of tiny targets.
+    # Morphological close → bridge gaps in sparse event clusters.
+    # When kernel is 0 the step is skipped (useful for high-noise scenes).
     if morph_kernel > 1:
-        kernel_size = morph_kernel + (1 - morph_kernel % 2)  # keep odd
+        kernel_size = morph_kernel + (1 - morph_kernel % 2)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_CLOSE, kernel)
         if dilate_iterations > 0:
@@ -133,4 +217,8 @@ def extract_detections(
         )
 
     detections = _nms_detections(detections, nms_iou, max_detections)
+
+    if static_filter is not None:
+        detections = static_filter.filter(detections)
+
     return detections, score_map

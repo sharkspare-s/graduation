@@ -13,7 +13,12 @@ import yaml
 from metavision_core.event_io import EventsIterator
 from metavision_sdk_ui import BaseWindow, EventLoop, MTWindow, UIAction, UIKeyEvent
 
-from tracking.postprocess import extract_detections
+from tracking.postprocess import (
+    StaticFilter,
+    accumulate_score_map,
+    build_score_heatmap,
+    extract_detections,
+)
 from tracking.tracker import MultiObjectTracker
 
 
@@ -22,13 +27,11 @@ from tracking.tracker import MultiObjectTracker
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="EV-UAV tracking v2 (Jetson-optimised)")
+    parser = argparse.ArgumentParser(description="EV-UAV tracking v3 (adaptive threshold + hot-pixel filter)")
     parser.add_argument("--config", default="configs/evisseg_evuav.yaml", type=str)
     parser.add_argument("--checkpoint", default="", type=str, help="Model checkpoint override")
-    parser.add_argument(
-        "--input-path", default="", type=str,
-        help="Optional raw event file; leave empty to open the first camera",
-    )
+    parser.add_argument("--input-path", default="", type=str,
+                        help="Optional raw event file; leave empty for live camera")
 
     # --- timing ------------------------------------------------------------
     parser.add_argument("--window-us", default=30000, type=int,
@@ -43,12 +46,19 @@ def parse_args():
     parser.add_argument("--max-events", default=15000, type=int,
                         help="Cap events per window")
 
-    # --- detection ---------------------------------------------------------
-    parser.add_argument("--score-thresh", default=0.30, type=float)
+    # --- detection thresholds (adaptive) -----------------------------------
+    parser.add_argument("--score-thresh-low", default=0.25, type=float,
+                        help="Lower threshold used when no visible track exists (search mode)")
+    parser.add_argument("--score-thresh-high", default=0.45, type=float,
+                        help="Higher threshold used when tracks are active (tracking mode)")
+    parser.add_argument("--score-ema", default=0.0, type=float,
+                        help="Temporal EMA for score_map (0=disabled, 0.2-0.4 recommended for dim targets)")
+
+    # --- morphology ---------------------------------------------------------
     parser.add_argument("--min-area", default=5, type=int)
     parser.add_argument("--morph-kernel", default=3, type=int,
                         help="Odd morphology kernel size (0 to disable)")
-    parser.add_argument("--dilate-iterations", default=1, type=int)
+    parser.add_argument("--dilate-iterations", default=0, type=int)
     parser.add_argument("--bbox-margin", default=4, type=int)
     parser.add_argument("--min-box-size", default=3, type=int)
     parser.add_argument("--max-box-area-ratio", default=0.15, type=float)
@@ -58,11 +68,20 @@ def parse_args():
     # --- tracker -----------------------------------------------------------
     parser.add_argument("--max-distance", default=30.0, type=float)
     parser.add_argument("--max-missed", default=8, type=int)
-    parser.add_argument("--min-hits", default=2, type=int)
+    parser.add_argument("--min-hits", default=3, type=int,
+                        help="Track confirmation threshold (hits needed to become visible)")
+    parser.add_argument("--min-track-score", default=0.30, type=float,
+                        help="Minimum detection score for a track to remain visible")
+    parser.add_argument("--static-thresh", default=4, type=int,
+                        help="Consecutive frames a detection stays still before being suppressed")
 
     # --- optimisations -----------------------------------------------------
     parser.add_argument("--fp16", action="store_true",
                         help="Use FP16 inference (Jetson: ~1.5-2x faster if spconv supports it)")
+
+    # --- debug -------------------------------------------------------------
+    parser.add_argument("--debug", action="store_true",
+                        help="Show score heatmap instead of binary foreground overlay")
 
     return parser.parse_args()
 
@@ -168,17 +187,22 @@ def events_to_batch(events, height, width, max_events):
 # Rendering
 # ---------------------------------------------------------------------------
 
-def render_frame(events, score_map, tracks, height, width, score_thresh):
+def render_frame(events, score_map, tracks, height, width, score_thresh, debug=False):
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
     if len(events["x"]):
         x = events["x"].astype(np.int32)
         y = events["y"].astype(np.int32)
         p = events["p"].astype(np.bool_)
-        canvas[y[~p], x[~p]] = (255, 80, 80)   # OFF events – red
-        canvas[y[p], x[p]] = (80, 200, 255)     # ON events – yellow
+        canvas[y[~p], x[~p]] = (255, 80, 80)
+        canvas[y[p], x[p]] = (80, 200, 255)
 
-    active = score_map >= score_thresh
-    canvas[active] = (0, 255, 0)                # foreground – green
+    if debug:
+        heatmap = build_score_heatmap(score_map)
+        canvas = cv2.addWeighted(canvas, 0.4, heatmap, 0.6, 0)
+    else:
+        active = score_map >= score_thresh
+        canvas[active] = (0, 255, 0)
 
     for track in tracks:
         x1, y1, x2, y2 = track.bbox
@@ -189,14 +213,14 @@ def render_frame(events, score_map, tracks, height, width, score_thresh):
     return canvas
 
 
-def draw_status(canvas, mode, dropped_jobs, stale_results, infer_ms, tracks, pending):
+def draw_status(canvas, mode, dropped_jobs, stale_results, infer_ms, tracks, pending, thresh):
     pending_str = " pending" if pending else ""
     status = (f"{mode}{pending_str} tracks:{len(tracks)} "
-              f"drop:{dropped_jobs} stale:{stale_results} infer:{infer_ms:.1f}ms")
+              f"thr:{thresh:.2f} drop:{dropped_jobs} stale:{stale_results} infer:{infer_ms:.1f}ms")
     cv2.putText(canvas, status, (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
-                0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                0.40, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(canvas, "Q / ESC to quit", (8, 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1, cv2.LINE_AA)
     return canvas
 
 
@@ -211,9 +235,18 @@ class DetectionResult:
     score_map: np.ndarray
     infer_ms: float
     dropped_jobs: int
+    score_thresh_used: float
 
 
-def infer_detections(model, sample, x_raw, y_raw, args, height, width):
+def _pick_score_thresh(tracker, args):
+    """Adaptive threshold: low when searching, high when tracking."""
+    if tracker.visible_tracks(allow_missed=True):
+        return args.score_thresh_high
+    return args.score_thresh_low
+
+
+def infer_detections(model, sample, x_raw, y_raw, args, height, width,
+                     tracker, static_filter, score_prev):
     from dataset.basedataset import BaseDataLoader
 
     batch = BaseDataLoader.custom_collate([sample])
@@ -229,16 +262,23 @@ def infer_detections(model, sample, x_raw, y_raw, args, height, width):
     if scores.ndim == 0:
         scores = np.array([float(scores)], dtype=np.float32)
 
+    score_thresh = _pick_score_thresh(tracker, args)
+
     detections, score_map = extract_detections(
         x=x_raw, y=y_raw, scores=scores, height=height, width=width,
-        score_thresh=args.score_thresh, min_area=args.min_area,
+        score_thresh=score_thresh, min_area=args.min_area,
         morph_kernel=args.morph_kernel, dilate_iterations=args.dilate_iterations,
         bbox_margin=args.bbox_margin, min_box_size=args.min_box_size,
         max_box_area_ratio=args.max_box_area_ratio,
         nms_iou=args.nms_iou, max_detections=args.max_detections,
+        static_filter=static_filter,
     )
+
+    # temporal EMA accumulation
+    score_map = accumulate_score_map(score_map, score_prev, args.score_ema)
+
     infer_ms = (time.perf_counter() - start) * 1000.0
-    return detections, score_map, infer_ms
+    return detections, score_map, infer_ms, score_thresh
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +354,9 @@ class LatestEventsBuffer:
 # Thread workers
 # ---------------------------------------------------------------------------
 
-def detection_worker(model, job_queue, stop_event, args, height, width):
+def detection_worker(model, job_queue, stop_event, args, height, width, tracker, static_filter):
     last_seq = 0
+    score_prev = None
     try:
         while not stop_event.is_set():
             seq, payload, closed = job_queue.wait_request(last_seq, timeout=0.05)
@@ -324,12 +365,14 @@ def detection_worker(model, job_queue, stop_event, args, height, width):
                 continue
             last_seq = seq
             request, dropped = payload
-            detections, score_map, infer_ms = infer_detections(
+            detections, score_map, infer_ms, thresh = infer_detections(
                 model, request["sample"], request["x_raw"], request["y_raw"],
-                args, height, width)
+                args, height, width, tracker, static_filter, score_prev)
+            score_prev = score_map
             job_queue.publish_result(DetectionResult(
                 frame_idx=request["frame_idx"], detections=detections,
-                score_map=score_map, infer_ms=infer_ms, dropped_jobs=dropped))
+                score_map=score_map, infer_ms=infer_ms, dropped_jobs=dropped,
+                score_thresh_used=thresh))
     finally:
         job_queue.close()
 
@@ -366,24 +409,42 @@ def install_stop_keyboard_handler(window, stop_event):
 
 
 # ---------------------------------------------------------------------------
+# Resolution check
+# ---------------------------------------------------------------------------
+
+def check_resolution(camera_hw, config_res):
+    """Warn if camera resolution differs from the config the model expects."""
+    c_h, c_w = camera_hw
+    cfg_w, cfg_h = config_res
+    if c_w != cfg_w or c_h != cfg_h:
+        print(f"[WARN] Camera resolution ({c_w}x{c_h}) != config res ({cfg_w}x{cfg_h}).")
+        print(f"       Events will be clipped to config resolution. "
+              f"Consider updating configs/evisseg_evuav.yaml DATA:res to [{c_w},{c_h}]")
+
+
+# ---------------------------------------------------------------------------
 # Offline (file) mode
 # ---------------------------------------------------------------------------
 
-def run_offline_tracking(args, model, tracker):
+def run_offline_tracking(args, model, tracker, static_filter):
     mv_iterator = EventsIterator(input_path=args.input_path, delta_t=args.window_us)
     height, width = mv_iterator.get_size()
+    check_resolution((height, width), cfg_res=(346, 260))
+
     blank_score_map = np.zeros((height, width), dtype=np.float32)
     frame_period = 1.0 / max(args.display_fps, 1)
 
     stop_event = threading.Event()
     latest_score_map = blank_score_map
     latest_infer_ms = 0.0
+    latest_thresh = args.score_thresh_low
     frame_idx = 0
     current_tracks = []
     current_mode = "offline-idle"
+    score_prev = None
 
     try:
-        with MTWindow(title="EV-UAV Tracking v2 (offline)", width=width,
+        with MTWindow(title="EV-UAV Tracking v3 (offline)", width=width,
                        height=height, mode=BaseWindow.RenderMode.BGR) as window:
             install_stop_keyboard_handler(window, stop_event)
 
@@ -397,9 +458,11 @@ def run_offline_tracking(args, model, tracker):
                 frame_idx += 1
                 if len(events) == 0:
                     canvas = render_frame(empty_viz_events(), blank_score_map,
-                                          current_tracks, height, width, args.score_thresh)
+                                          current_tracks, height, width,
+                                          latest_thresh, debug=args.debug)
                     canvas = draw_status(canvas, "offline-empty", 0, 0,
-                                         latest_infer_ms, current_tracks, False)
+                                         latest_infer_ms, current_tracks, False,
+                                         latest_thresh)
                     window.show_async(canvas)
                 else:
                     sample, viz_events, x_raw, y_raw = events_to_batch(
@@ -409,8 +472,11 @@ def run_offline_tracking(args, model, tracker):
                         or not tracker.visible_tracks(allow_missed=True)
                     )
                     if should_detect:
-                        detections, latest_score_map, latest_infer_ms = infer_detections(
-                            model, sample, x_raw, y_raw, args, height, width)
+                        detections, score_map, latest_infer_ms, latest_thresh = infer_detections(
+                            model, sample, x_raw, y_raw, args, height, width,
+                            tracker, static_filter, score_prev)
+                        score_prev = score_map
+                        latest_score_map = score_map
                         current_tracks = tracker.update(detections)
                         current_mode = "offline-detect"
                     else:
@@ -419,9 +485,11 @@ def run_offline_tracking(args, model, tracker):
 
                     score_map = latest_score_map if current_mode == "offline-detect" else blank_score_map
                     canvas = render_frame(viz_events, score_map, current_tracks,
-                                          height, width, args.score_thresh)
+                                          height, width, latest_thresh,
+                                          debug=args.debug)
                     canvas = draw_status(canvas, current_mode, 0, 0,
-                                         latest_infer_ms, current_tracks, False)
+                                         latest_infer_ms, current_tracks, False,
+                                         latest_thresh)
                     window.show_async(canvas)
 
                 remaining = frame_period - (time.perf_counter() - loop_start)
@@ -448,18 +516,27 @@ def main():
         max_distance=args.max_distance,
         max_missed=args.max_missed,
         min_hits=args.min_hits,
+        min_track_score=args.min_track_score,
+        static_thresh=args.static_thresh,
     )
+    static_filter = StaticFilter(static_thresh=args.static_thresh)
 
     if args.input_path:
-        run_offline_tracking(args, model, tracker)
+        run_offline_tracking(args, model, tracker, static_filter)
         return
 
     # --- live camera -------------------------------------------------------
     mv_iterator = EventsIterator(input_path=args.input_path, delta_t=args.window_us)
     height, width = mv_iterator.get_size()
-    print(f"Camera resolution: {width}x{height}")
-    print(f"Window: {args.window_us} us  |  detect every: {args.detect_every}  |  "
-          f"max events: {args.max_events}  |  FP16: {args.fp16}")
+    check_resolution((height, width), cfg_res=cfg.res)
+
+    print(f"Camera: {width}x{height}  |  window: {args.window_us} us  |  "
+          f"detect-every: {args.detect_every}  |  max-events: {args.max_events}  |  "
+          f"FP16: {args.fp16}  |  debug: {args.debug}")
+    print(f"Adaptive threshold: search={args.score_thresh_low}  "
+          f"track={args.score_thresh_high}  |  EMA: {args.score_ema}")
+    print(f"Static filter: {args.static_thresh} frames  |  "
+          f"min-hits: {args.min_hits}  |  min-track-score: {args.min_track_score}")
 
     blank_score_map = np.zeros((height, width), dtype=np.float32)
     stop_event = threading.Event()
@@ -471,12 +548,12 @@ def main():
         daemon=False)
     worker_thread = threading.Thread(
         target=detection_worker,
-        args=(model, job_queue, stop_event, args, height, width),
+        args=(model, job_queue, stop_event, args, height, width, tracker, static_filter),
         daemon=False)
     capture_thread.start()
     worker_thread.start()
 
-    title = "EV-UAV Tracking v2"
+    title = "EV-UAV Tracking v3" if not args.debug else "EV-UAV Tracking v3 [DEBUG]"
     frame_period = 1.0 / max(args.display_fps, 1)
     last_result_seq = 0
     latest_score_map = blank_score_map
@@ -488,6 +565,7 @@ def main():
     current_viz_events = empty_viz_events()
     current_tracks = []
     current_mode = "idle"
+    latest_thresh = args.score_thresh_low
 
     try:
         with MTWindow(title=title, width=width, height=height,
@@ -505,13 +583,12 @@ def main():
                 if has_new_events:
                     last_events_seq = events_seq
                     frame_idx += 1
-                    current_viz_events = (empty_viz_events() if len(events) == 0
-                                          else None)  # will be set below
+                    current_viz_events = empty_viz_events() if len(events) == 0 else None
 
                 if closed and not has_new_events:
                     break
 
-                # --- consume detection result ---------------------------------
+                # --- consume detection result -------------------------------
                 result_seq, result = job_queue.get_latest_result(last_result_seq)
                 if result is not None:
                     last_result_seq = result_seq
@@ -519,6 +596,7 @@ def main():
                         latest_score_map = result.score_map
                         latest_infer_ms = result.infer_ms
                         latest_dropped_jobs = result.dropped_jobs
+                        latest_thresh = result.score_thresh_used
                         current_tracks = tracker.update(result.detections)
                         current_mode = "detect"
                     else:
@@ -530,24 +608,28 @@ def main():
                     current_tracks = tracker.predict_only()
                     current_mode = "predict"
 
-                # --- render ----------------------------------------------------
+                # --- render -------------------------------------------------
                 if not has_new_events:
                     score_map = latest_score_map if current_mode == "detect" else blank_score_map
                     canvas = render_frame(current_viz_events, score_map,
-                                          current_tracks, height, width, args.score_thresh)
+                                          current_tracks, height, width,
+                                          latest_thresh, debug=args.debug)
                     canvas = draw_status(canvas, current_mode + "-hold",
                                          latest_dropped_jobs, stale_results,
                                          latest_infer_ms, current_tracks,
-                                         job_queue.has_pending_work())
+                                         job_queue.has_pending_work(),
+                                         latest_thresh)
                     window.show_async(canvas)
                 elif len(events) == 0:
                     current_viz_events = empty_viz_events()
                     canvas = render_frame(empty_viz_events(), blank_score_map,
-                                          current_tracks, height, width, args.score_thresh)
+                                          current_tracks, height, width,
+                                          latest_thresh, debug=args.debug)
                     canvas = draw_status(canvas, current_mode + "-empty",
                                          latest_dropped_jobs, stale_results,
                                          latest_infer_ms, current_tracks,
-                                         job_queue.has_pending_work())
+                                         job_queue.has_pending_work(),
+                                         latest_thresh)
                     window.show_async(canvas)
                 else:
                     sample, viz_events, x_raw, y_raw = events_to_batch(
@@ -567,11 +649,13 @@ def main():
 
                     score_map = latest_score_map if current_mode == "detect" else blank_score_map
                     canvas = render_frame(viz_events, score_map, current_tracks,
-                                          height, width, args.score_thresh)
+                                          height, width, latest_thresh,
+                                          debug=args.debug)
                     canvas = draw_status(canvas, current_mode,
                                          latest_dropped_jobs, stale_results,
                                          latest_infer_ms, current_tracks,
-                                         job_queue.has_pending_work())
+                                         job_queue.has_pending_work(),
+                                         latest_thresh)
                     window.show_async(canvas)
 
                 remaining = frame_period - (time.perf_counter() - loop_start)
