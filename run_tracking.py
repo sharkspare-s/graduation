@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import yaml
 from metavision_core.event_io import EventsIterator
-from metavision_sdk_cv import ActivityNoiseFilterAlgorithm, TrailFilterAlgorithm
 from metavision_sdk_ui import BaseWindow, EventLoop, MTWindow, UIAction, UIKeyEvent
 
 from tracking.postprocess import (
@@ -144,19 +143,47 @@ def empty_viz_events():
             "p": np.empty((0,), dtype=np.bool_)}
 
 
-def filter_events(events, activity_filter, trail_filter, buf):
-    """Apply Metavision SDK noise filters.  Pass-through if both disabled."""
-    if activity_filter is None and trail_filter is None:
+def filter_events(events, activity_us=0, trail_us=0):
+    """Pure-Python spatiotemporal noise filter (no SDK_CV dependency).
+
+    activity_us: remove events without close spatiotemporal neighbors (>0 to enable)
+    trail_us:   remove hot pixels (pixels with excessive event count)
+    """
+    if len(events) == 0 or (activity_us <= 0 and trail_us <= 0):
         return events
-    if len(events) == 0:
-        return events
-    if activity_filter is not None:
-        activity_filter.process_events(events, buf)
-        if trail_filter is not None:
-            trail_filter.process_events_(buf)
-        return buf.numpy()
-    trail_filter.process_events(events, buf)
-    return buf.numpy()
+
+    x = events["x"].astype(np.int32)
+    y = events["y"].astype(np.int32)
+    t = events["t"].astype(np.int64)
+    n = len(x)
+    keep = np.ones(n, dtype=bool)
+
+    if activity_us > 0:
+        # Quantise into 3x3px × activity_us spatiotemporal bins.
+        # Events without at least 2 neighbours in the same bin are noise.
+        tx = x // 3
+        ty = y // 3
+        tt = t // activity_us
+        # Pack into 64-bit so we can np.unique it
+        max_tx = tx.max() - tx.min() + 1
+        max_ty = ty.max() - ty.min() + 1
+        key = tt.astype(np.int64) * (max_tx * max_ty) + ty.astype(np.int64) * max_tx + tx.astype(np.int64)
+        _, inverse, counts = np.unique(key, return_inverse=True, return_counts=True)
+        keep &= counts[inverse] >= 2
+
+    if trail_us > 0 and np.any(keep):
+        indices = np.where(keep)[0]
+        xk, yk = x[keep], y[keep]
+        pixel = yk.astype(np.int64) * np.int64(x.max() + 1) + xk.astype(np.int64)
+        _, pix_inv, pix_counts = np.unique(pixel, return_inverse=True, return_counts=True)
+        thr = max(6, int(pix_counts.mean() + 4 * pix_counts.std()))
+        hot = np.where(pix_counts > thr)[0]
+        if len(hot) > 0:
+            keep[indices[np.isin(pix_inv, hot)]] = False
+
+    if not np.all(keep):
+        return {k: v[keep] for k, v in events.items()}
+    return events
 
 
 def build_evs_norm(events, height, width):
@@ -483,14 +510,6 @@ def run_offline_tracking(args, model, tracker, static_filter):
     target_w, target_h = (int(x) for x in args.target_res.split("x"))
     check_resolution((height, width), cfg_res=(target_w, target_h))
 
-    # Noise filters (Metavision SDK)
-    act_filter = (ActivityNoiseFilterAlgorithm(width, height, args.activity_filter_us)
-                  if args.activity_filter_us > 0 else None)
-    trail_filter = (TrailFilterAlgorithm(width, height, args.trail_filter_us)
-                    if args.trail_filter_us > 0 else None)
-    filter_buf = (ActivityNoiseFilterAlgorithm.get_empty_output_buffer()
-                  if act_filter is not None or trail_filter is not None else None)
-
     blank_score_map = np.zeros((height, width), dtype=np.float32)
     frame_period = 1.0 / max(args.display_fps, 1)
 
@@ -518,7 +537,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
 
                 frame_idx += 1
                 # Apply Metavision SDK noise filters before model
-                events = filter_events(events, act_filter, trail_filter, filter_buf)
+                events = filter_events(events, args.activity_filter_us, args.trail_filter_us)
                 if len(events) == 0:
                     canvas = render_frame(empty_viz_events(), blank_score_map, latest_foreground_mask,
                                           current_tracks, height, width,
@@ -595,18 +614,11 @@ def main():
     target_w, target_h = (int(x) for x in args.target_res.split("x"))
     check_resolution((height, width), cfg_res=(target_w, target_h))
 
-    # Noise filters (Metavision SDK)
-    act_filter = (ActivityNoiseFilterAlgorithm(width, height, args.activity_filter_us)
-                  if args.activity_filter_us > 0 else None)
-    trail_filter = (TrailFilterAlgorithm(width, height, args.trail_filter_us)
-                    if args.trail_filter_us > 0 else None)
-    filter_buf = (ActivityNoiseFilterAlgorithm.get_empty_output_buffer()
-                  if act_filter is not None or trail_filter is not None else None)
-
     print(f"Camera: {width}x{height} -> model: {target_w}x{target_h}  |  window: {args.window_us} us  |  "
           f"detect-every: {args.detect_every}  |  max-events: {args.max_events}  |  "
           f"FP16: {args.fp16}  |  debug: {args.debug}")
-    print(f"Noise filter: activity={args.activity_filter_us}us trail={args.trail_filter_us}us")
+    if args.activity_filter_us > 0 or args.trail_filter_us > 0:
+        print(f"Noise filter (Python): activity={args.activity_filter_us}us trail={args.trail_filter_us}us")
     print(f"Adaptive threshold: search={args.score_thresh_low}  "
           f"track={args.score_thresh_high}  |  EMA: {args.score_ema}")
     print(f"Static filter: {args.static_thresh} frames  |  "
@@ -659,7 +671,7 @@ def main():
                 if has_new_events:
                     last_events_seq = events_seq
                     frame_idx += 1
-                    events = filter_events(events, act_filter, trail_filter, filter_buf)
+                    events = filter_events(events, args.activity_filter_us, args.trail_filter_us)
                     current_viz_events = empty_viz_events() if len(events) == 0 else None
 
                 if closed and not has_new_events:
