@@ -43,8 +43,10 @@ def parse_args():
     parser.add_argument("--display-fps", default=30, type=int)
 
     # --- data --------------------------------------------------------------
-    parser.add_argument("--max-events", default=15000, type=int,
+    parser.add_argument("--max-events", default=50000, type=int,
                         help="Cap events per window")
+    parser.add_argument("--target-res", default="346x260", type=str,
+                        help="Model target resolution WxH (events scaled from camera res to this)")
 
     # --- detection thresholds (adaptive) -----------------------------------
     parser.add_argument("--score-thresh-low", default=0.25, type=float,
@@ -146,7 +148,7 @@ def build_evs_norm(events, height, width):
     return np.stack([x_norm, y_norm, t_norm, p], axis=1)
 
 
-def events_to_batch(events, height, width, max_events):
+def events_to_batch(events, height, width, max_events, target_w=346, target_h=260):
     x_raw = events["x"].astype(np.int32)
     y_raw = events["y"].astype(np.int32)
     t_raw = events["t"].astype(np.int64)
@@ -154,9 +156,16 @@ def events_to_batch(events, height, width, max_events):
 
     n = x_raw.shape[0]
     if n > max_events:
-        keep = np.linspace(0, n - 1, max_events, dtype=np.int64)
+        keep = np.random.default_rng().choice(n, max_events, replace=False)
+        keep.sort()
         x_raw = x_raw[keep]; y_raw = y_raw[keep]
         t_raw = t_raw[keep]; p_raw = p_raw[keep]
+
+    # Scale camera coords → model target resolution
+    sx = (target_w - 1) / max(width - 1, 1)
+    sy = (target_h - 1) / max(height - 1, 1)
+    x_model = np.rint(x_raw.astype(np.float32) * sx).astype(np.int32)
+    y_model = np.rint(y_raw.astype(np.float32) * sy).astype(np.int32)
 
     t_shift = t_raw - t_raw.min()
     t_max = int(t_shift.max())
@@ -165,8 +174,8 @@ def events_to_batch(events, height, width, max_events):
     else:
         t_coord = np.zeros_like(t_raw, dtype=np.int32)
 
-    x_coord = np.clip(x_raw, 1, max(1, width - 2))
-    y_coord = np.clip(y_raw, 1, max(1, height - 2))
+    x_coord = np.clip(x_model, 1, max(1, target_w - 2))
+    y_coord = np.clip(y_model, 1, max(1, target_h - 2))
     t_coord = np.clip(t_coord, 1, 8188)
 
     norm_events = {"x": x_raw.astype(np.int32), "y": y_raw.astype(np.int32),
@@ -176,7 +185,7 @@ def events_to_batch(events, height, width, max_events):
 
     sample = {
         "ev_loc": np.stack([x_coord, y_coord, t_coord], axis=1),
-        "evs_norm": build_evs_norm(norm_events, height, width),
+        "evs_norm": build_evs_norm(norm_events, target_h, target_w),
         "seg_label": np.zeros(len(x_raw), dtype=np.float32),
         "idx": np.arange(len(x_raw), dtype=np.int64),
     }
@@ -246,7 +255,7 @@ def _pick_score_thresh(tracker, args):
 
 
 def infer_detections(model, sample, x_raw, y_raw, args, height, width,
-                     tracker, static_filter, score_prev):
+                     tracker, static_filter, score_prev_container, target_w, target_h):
     from dataset.basedataset import BaseDataLoader
 
     batch = BaseDataLoader.custom_collate([sample])
@@ -264,8 +273,9 @@ def infer_detections(model, sample, x_raw, y_raw, args, height, width,
 
     score_thresh = _pick_score_thresh(tracker, args)
 
+    # Detection in model-resolution space
     detections, score_map = extract_detections(
-        x=x_raw, y=y_raw, scores=scores, height=height, width=width,
+        x=x_raw, y=y_raw, scores=scores, height=target_h, width=target_w,
         score_thresh=score_thresh, min_area=args.min_area,
         morph_kernel=args.morph_kernel, dilate_iterations=args.dilate_iterations,
         bbox_margin=args.bbox_margin, min_box_size=args.min_box_size,
@@ -274,8 +284,24 @@ def infer_detections(model, sample, x_raw, y_raw, args, height, width,
         static_filter=static_filter,
     )
 
-    # temporal EMA accumulation
+    # EMA accumulation at model resolution
+    score_prev = score_prev_container[0]
     score_map = accumulate_score_map(score_map, score_prev, args.score_ema)
+    score_prev_container[0] = score_map
+
+    # Scale score_map and detections back to camera resolution
+    if width != target_w or height != target_h:
+        score_map = cv2.resize(score_map, (width, height), interpolation=cv2.INTER_LINEAR)
+        sc_x = width / target_w
+        sc_y = height / target_h
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            det.bbox = (
+                int(x1 * sc_x), int(y1 * sc_y),
+                int(x2 * sc_x), int(y2 * sc_y),
+            )
+            det.center = (det.center[0] * sc_x, det.center[1] * sc_y)
+            det.pos_key = (int(det.center[0]) // 4, int(det.center[1]) // 4)
 
     infer_ms = (time.perf_counter() - start) * 1000.0
     return detections, score_map, infer_ms, score_thresh
@@ -354,9 +380,10 @@ class LatestEventsBuffer:
 # Thread workers
 # ---------------------------------------------------------------------------
 
-def detection_worker(model, job_queue, stop_event, args, height, width, tracker, static_filter):
+def detection_worker(model, job_queue, stop_event, args, height, width, tracker, static_filter,
+                     target_w, target_h):
     last_seq = 0
-    score_prev = None
+    score_prev_container = [None]
     try:
         while not stop_event.is_set():
             seq, payload, closed = job_queue.wait_request(last_seq, timeout=0.05)
@@ -367,8 +394,8 @@ def detection_worker(model, job_queue, stop_event, args, height, width, tracker,
             request, dropped = payload
             detections, score_map, infer_ms, thresh = infer_detections(
                 model, request["sample"], request["x_raw"], request["y_raw"],
-                args, height, width, tracker, static_filter, score_prev)
-            score_prev = score_map
+                args, height, width, tracker, static_filter, score_prev_container,
+                target_w, target_h)
             job_queue.publish_result(DetectionResult(
                 frame_idx=request["frame_idx"], detections=detections,
                 score_map=score_map, infer_ms=infer_ms, dropped_jobs=dropped,
@@ -429,7 +456,8 @@ def check_resolution(camera_hw, cfg_res):
 def run_offline_tracking(args, model, tracker, static_filter):
     mv_iterator = EventsIterator(input_path=args.input_path, delta_t=args.window_us)
     height, width = mv_iterator.get_size()
-    check_resolution((height, width), cfg_res=(346, 260))
+    target_w, target_h = (int(x) for x in args.target_res.split("x"))
+    check_resolution((height, width), cfg_res=(target_w, target_h))
 
     blank_score_map = np.zeros((height, width), dtype=np.float32)
     frame_period = 1.0 / max(args.display_fps, 1)
@@ -441,7 +469,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
     frame_idx = 0
     current_tracks = []
     current_mode = "offline-idle"
-    score_prev = None
+    score_prev_container = [None]  # mutable, updated inside infer_detections
 
     try:
         with MTWindow(title="EV-UAV Tracking v3 (offline)", width=width,
@@ -466,7 +494,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
                     window.show_async(canvas)
                 else:
                     sample, viz_events, x_raw, y_raw = events_to_batch(
-                        events, height, width, args.max_events)
+                        events, height, width, args.max_events, target_w, target_h)
                     should_detect = (
                         frame_idx % max(args.detect_every, 1) == 1
                         or not tracker.visible_tracks(allow_missed=True)
@@ -474,8 +502,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
                     if should_detect:
                         detections, score_map, latest_infer_ms, latest_thresh = infer_detections(
                             model, sample, x_raw, y_raw, args, height, width,
-                            tracker, static_filter, score_prev)
-                        score_prev = score_map
+                            tracker, static_filter, score_prev_container, target_w, target_h)
                         latest_score_map = score_map
                         current_tracks = tracker.update(detections)
                         current_mode = "offline-detect"
@@ -528,9 +555,10 @@ def main():
     # --- live camera -------------------------------------------------------
     mv_iterator = EventsIterator(input_path=args.input_path, delta_t=args.window_us)
     height, width = mv_iterator.get_size()
-    check_resolution((height, width), cfg_res=cfg.res)
+    target_w, target_h = (int(x) for x in args.target_res.split("x"))
+    check_resolution((height, width), cfg_res=(target_w, target_h))
 
-    print(f"Camera: {width}x{height}  |  window: {args.window_us} us  |  "
+    print(f"Camera: {width}x{height} -> model: {target_w}x{target_h}  |  window: {args.window_us} us  |  "
           f"detect-every: {args.detect_every}  |  max-events: {args.max_events}  |  "
           f"FP16: {args.fp16}  |  debug: {args.debug}")
     print(f"Adaptive threshold: search={args.score_thresh_low}  "
@@ -548,7 +576,8 @@ def main():
         daemon=False)
     worker_thread = threading.Thread(
         target=detection_worker,
-        args=(model, job_queue, stop_event, args, height, width, tracker, static_filter),
+        args=(model, job_queue, stop_event, args, height, width, tracker, static_filter,
+              target_w, target_h),
         daemon=False)
     capture_thread.start()
     worker_thread.start()
@@ -633,7 +662,7 @@ def main():
                     window.show_async(canvas)
                 else:
                     sample, viz_events, x_raw, y_raw = events_to_batch(
-                        events, height, width, args.max_events)
+                        events, height, width, args.max_events, target_w, target_h)
                     current_viz_events = viz_events
                     should_detect = (
                         frame_idx % max(args.detect_every, 1) == 1
