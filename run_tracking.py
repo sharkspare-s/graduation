@@ -178,7 +178,7 @@ def events_to_batch(events, height, width, max_events, target_w=346, target_h=26
     y_coord = np.clip(y_model, 1, max(1, target_h - 2))
     t_coord = np.clip(t_coord, 1, 8188)
 
-    norm_events = {"x": x_raw.astype(np.int32), "y": y_raw.astype(np.int32),
+    norm_events = {"x": x_model.astype(np.int32), "y": y_model.astype(np.int32),
                    "t": t_raw.astype(np.int64), "p": p_raw}
 
     viz_events = {"x": x_raw.astype(np.int32), "y": y_raw.astype(np.int32), "p": p_raw}
