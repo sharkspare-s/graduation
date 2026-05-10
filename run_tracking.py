@@ -182,7 +182,7 @@ def filter_events(events, activity_us=0, trail_us=0):
             keep[indices[np.isin(pix_inv, hot)]] = False
 
     if not np.all(keep):
-        return {k: v[keep] for k, v in events.items()}
+        return events[keep]
     return events
 
 
