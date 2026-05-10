@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from typing import Deque, List, Optional, Tuple
 
 import cv2
@@ -16,6 +17,8 @@ class Detection:
     area: int
     # Position fingerprint for hot-pixel suppression (quantised to 4px grid)
     pos_key: Tuple[int, int] = (0, 0)
+    # Connected-component id kept for visualization after filtering.
+    component_id: int = -1
 
     def __post_init__(self):
         if self.pos_key == (0, 0):
@@ -73,7 +76,7 @@ class StaticFilter:
 
     def __init__(self, static_thresh: int = 4):
         self.static_thresh = static_thresh
-        self._history: Deque[List[Tuple[int, int]]] = Deque(maxlen=_MAX_STATIC_HISTORY)
+        self._history: Deque[List[Tuple[int, int]]] = deque(maxlen=_MAX_STATIC_HISTORY)
 
     def filter(self, detections: List[Detection]) -> List[Detection]:
         keys = [d.pos_key for d in detections]
@@ -166,11 +169,11 @@ def extract_detections(
     nms_iou: float = 0.3,
     max_detections: int = 10,
     static_filter: Optional[StaticFilter] = None,
-) -> Tuple[List[Detection], np.ndarray]:
+) -> Tuple[List[Detection], np.ndarray, np.ndarray]:
 
     score_map, binary_map = build_score_map(x, y, scores, height, width, score_thresh)
     if binary_map.max() == 0:
-        return [], score_map
+        return [], score_map, binary_map
 
     # Morphological close → bridge gaps in sparse event clusters.
     # When kernel is 0 the step is skipped (useful for high-noise scenes).
@@ -187,6 +190,7 @@ def extract_detections(
 
     frame_area = float(max(width * height, 1))
     detections: List[Detection] = []
+    foreground_mask = np.zeros_like(binary_map)
 
     for label_idx in range(1, num_labels):
         x0, y0, w, h, area = stats[label_idx]
@@ -213,6 +217,7 @@ def extract_detections(
                 center=(float(cx), float(cy)),
                 score=score,
                 area=int(area),
+                component_id=label_idx,
             )
         )
 
@@ -221,4 +226,8 @@ def extract_detections(
     if static_filter is not None:
         detections = static_filter.filter(detections)
 
-    return detections, score_map
+    for det in detections:
+        if det.component_id > 0:
+            foreground_mask[labels == det.component_id] = 1
+
+    return detections, score_map, foreground_mask

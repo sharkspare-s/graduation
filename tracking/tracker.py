@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Sequence, Tuple
 
@@ -89,7 +90,7 @@ class Track:
     hits: int = 1
     missed: int = 0
     # History of quantised centroids for static-track detection
-    _pos_history: Deque[Tuple[int, int]] = field(default_factory=lambda: Deque(maxlen=_STATIC_HISTORY_LEN))
+    _pos_history: Deque[Tuple[int, int]] = field(default_factory=lambda: deque(maxlen=_STATIC_HISTORY_LEN))
 
     @property
     def avg_score(self) -> float:
@@ -242,6 +243,8 @@ class MultiObjectTracker:
 
         for d_idx in unmatched_detections:
             det = detections[d_idx]
+            if det.score < self.min_track_score:
+                continue
             track = Track(track_id=self.next_id, score=det.score)
             track.kf.init(det.center[0], det.center[1])
             x1, y1, x2, y2 = det.bbox

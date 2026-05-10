@@ -196,7 +196,7 @@ def events_to_batch(events, height, width, max_events, target_w=346, target_h=26
 # Rendering
 # ---------------------------------------------------------------------------
 
-def render_frame(events, score_map, tracks, height, width, score_thresh, debug=False):
+def render_frame(events, score_map, foreground_mask, tracks, height, width, score_thresh, debug=False):
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
 
     if len(events["x"]):
@@ -210,8 +210,7 @@ def render_frame(events, score_map, tracks, height, width, score_thresh, debug=F
         heatmap = build_score_heatmap(score_map)
         canvas = cv2.addWeighted(canvas, 0.4, heatmap, 0.6, 0)
     else:
-        active = score_map >= score_thresh
-        canvas[active] = (0, 255, 0)
+        canvas[foreground_mask.astype(bool)] = (0, 255, 0)
 
     for track in tracks:
         x1, y1, x2, y2 = track.bbox
@@ -242,6 +241,7 @@ class DetectionResult:
     frame_idx: int
     detections: list
     score_map: np.ndarray
+    foreground_mask: np.ndarray
     infer_ms: float
     dropped_jobs: int
     score_thresh_used: float
@@ -274,7 +274,7 @@ def infer_detections(model, sample, x_raw, y_raw, args, height, width,
     score_thresh = _pick_score_thresh(tracker, args)
 
     # Detection in model-resolution space
-    detections, score_map = extract_detections(
+    detections, score_map, foreground_mask = extract_detections(
         x=x_raw, y=y_raw, scores=scores, height=target_h, width=target_w,
         score_thresh=score_thresh, min_area=args.min_area,
         morph_kernel=args.morph_kernel, dilate_iterations=args.dilate_iterations,
@@ -292,6 +292,7 @@ def infer_detections(model, sample, x_raw, y_raw, args, height, width,
     # Scale score_map and detections back to camera resolution
     if width != target_w or height != target_h:
         score_map = cv2.resize(score_map, (width, height), interpolation=cv2.INTER_LINEAR)
+        foreground_mask = cv2.resize(foreground_mask, (width, height), interpolation=cv2.INTER_NEAREST)
         sc_x = width / target_w
         sc_y = height / target_h
         for det in detections:
@@ -304,7 +305,7 @@ def infer_detections(model, sample, x_raw, y_raw, args, height, width,
             det.pos_key = (int(det.center[0]) // 4, int(det.center[1]) // 4)
 
     infer_ms = (time.perf_counter() - start) * 1000.0
-    return detections, score_map, infer_ms, score_thresh
+    return detections, score_map, foreground_mask, infer_ms, score_thresh
 
 
 # ---------------------------------------------------------------------------
@@ -392,13 +393,14 @@ def detection_worker(model, job_queue, stop_event, args, height, width, tracker,
                 continue
             last_seq = seq
             request, dropped = payload
-            detections, score_map, infer_ms, thresh = infer_detections(
+            detections, score_map, foreground_mask, infer_ms, thresh = infer_detections(
                 model, request["sample"], request["x_raw"], request["y_raw"],
                 args, height, width, tracker, static_filter, score_prev_container,
                 target_w, target_h)
             job_queue.publish_result(DetectionResult(
                 frame_idx=request["frame_idx"], detections=detections,
-                score_map=score_map, infer_ms=infer_ms, dropped_jobs=dropped,
+                score_map=score_map, foreground_mask=foreground_mask,
+                infer_ms=infer_ms, dropped_jobs=dropped,
                 score_thresh_used=thresh))
     finally:
         job_queue.close()
@@ -464,6 +466,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
 
     stop_event = threading.Event()
     latest_score_map = blank_score_map
+    latest_foreground_mask = np.zeros((height, width), dtype=np.uint8)
     latest_infer_ms = 0.0
     latest_thresh = args.score_thresh_low
     frame_idx = 0
@@ -485,7 +488,7 @@ def run_offline_tracking(args, model, tracker, static_filter):
 
                 frame_idx += 1
                 if len(events) == 0:
-                    canvas = render_frame(empty_viz_events(), blank_score_map,
+                    canvas = render_frame(empty_viz_events(), blank_score_map, latest_foreground_mask,
                                           current_tracks, height, width,
                                           latest_thresh, debug=args.debug)
                     canvas = draw_status(canvas, "offline-empty", 0, 0,
@@ -500,10 +503,11 @@ def run_offline_tracking(args, model, tracker, static_filter):
                         or not tracker.visible_tracks(allow_missed=True)
                     )
                     if should_detect:
-                        detections, score_map, latest_infer_ms, latest_thresh = infer_detections(
+                        detections, score_map, foreground_mask, latest_infer_ms, latest_thresh = infer_detections(
                             model, sample, x_raw, y_raw, args, height, width,
                             tracker, static_filter, score_prev_container, target_w, target_h)
                         latest_score_map = score_map
+                        latest_foreground_mask = foreground_mask
                         current_tracks = tracker.update(detections)
                         current_mode = "offline-detect"
                     else:
@@ -511,7 +515,8 @@ def run_offline_tracking(args, model, tracker, static_filter):
                         current_mode = "offline-predict"
 
                     score_map = latest_score_map if current_mode == "offline-detect" else blank_score_map
-                    canvas = render_frame(viz_events, score_map, current_tracks,
+                    foreground_mask = latest_foreground_mask if current_mode == "offline-detect" else np.zeros((height, width), dtype=np.uint8)
+                    canvas = render_frame(viz_events, score_map, foreground_mask, current_tracks,
                                           height, width, latest_thresh,
                                           debug=args.debug)
                     canvas = draw_status(canvas, current_mode, 0, 0,
@@ -586,6 +591,7 @@ def main():
     frame_period = 1.0 / max(args.display_fps, 1)
     last_result_seq = 0
     latest_score_map = blank_score_map
+    latest_foreground_mask = np.zeros((height, width), dtype=np.uint8)
     latest_infer_ms = 0.0
     latest_dropped_jobs = 0
     stale_results = 0
@@ -623,6 +629,7 @@ def main():
                     last_result_seq = result_seq
                     if frame_idx - result.frame_idx <= max(args.max_result_lag, 0):
                         latest_score_map = result.score_map
+                        latest_foreground_mask = result.foreground_mask
                         latest_infer_ms = result.infer_ms
                         latest_dropped_jobs = result.dropped_jobs
                         latest_thresh = result.score_thresh_used
@@ -640,7 +647,8 @@ def main():
                 # --- render -------------------------------------------------
                 if not has_new_events:
                     score_map = latest_score_map if current_mode == "detect" else blank_score_map
-                    canvas = render_frame(current_viz_events, score_map,
+                    foreground_mask = latest_foreground_mask if current_mode == "detect" else np.zeros((height, width), dtype=np.uint8)
+                    canvas = render_frame(current_viz_events, score_map, foreground_mask,
                                           current_tracks, height, width,
                                           latest_thresh, debug=args.debug)
                     canvas = draw_status(canvas, current_mode + "-hold",
@@ -651,7 +659,7 @@ def main():
                     window.show_async(canvas)
                 elif len(events) == 0:
                     current_viz_events = empty_viz_events()
-                    canvas = render_frame(empty_viz_events(), blank_score_map,
+                    canvas = render_frame(empty_viz_events(), blank_score_map, np.zeros((height, width), dtype=np.uint8),
                                           current_tracks, height, width,
                                           latest_thresh, debug=args.debug)
                     canvas = draw_status(canvas, current_mode + "-empty",
@@ -677,7 +685,8 @@ def main():
                         })
 
                     score_map = latest_score_map if current_mode == "detect" else blank_score_map
-                    canvas = render_frame(viz_events, score_map, current_tracks,
+                    foreground_mask = latest_foreground_mask if current_mode == "detect" else np.zeros((height, width), dtype=np.uint8)
+                    canvas = render_frame(viz_events, score_map, foreground_mask, current_tracks,
                                           height, width, latest_thresh,
                                           debug=args.debug)
                     canvas = draw_status(canvas, current_mode,
