@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import yaml
 from metavision_core.event_io import EventsIterator
+from metavision_sdk_cv import ActivityNoiseFilterAlgorithm, TrailFilterAlgorithm
 from metavision_sdk_ui import BaseWindow, EventLoop, MTWindow, UIAction, UIKeyEvent
 
 from tracking.postprocess import (
@@ -47,6 +48,12 @@ def parse_args():
                         help="Cap events per window")
     parser.add_argument("--target-res", default="346x260", type=str,
                         help="Model target resolution WxH (events scaled from camera res to this)")
+
+    # --- noise filters (Metavision SDK CV) ----------------------------------
+    parser.add_argument("--activity-filter-us", default=10000, type=int,
+                        help="Activity noise filter window [us] (0 to disable)")
+    parser.add_argument("--trail-filter-us", default=1000, type=int,
+                        help="Trail/hot-pixel filter window [us] (0 to disable)")
 
     # --- detection thresholds (adaptive) -----------------------------------
     parser.add_argument("--score-thresh-low", default=0.25, type=float,
@@ -135,6 +142,21 @@ def empty_viz_events():
     return {"x": np.empty((0,), dtype=np.int32),
             "y": np.empty((0,), dtype=np.int32),
             "p": np.empty((0,), dtype=np.bool_)}
+
+
+def filter_events(events, activity_filter, trail_filter, buf):
+    """Apply Metavision SDK noise filters.  Pass-through if both disabled."""
+    if activity_filter is None and trail_filter is None:
+        return events
+    if len(events) == 0:
+        return events
+    if activity_filter is not None:
+        activity_filter.process_events(events, buf)
+        if trail_filter is not None:
+            trail_filter.process_events_(buf)
+        return buf.numpy()
+    trail_filter.process_events(events, buf)
+    return buf.numpy()
 
 
 def build_evs_norm(events, height, width):
@@ -461,6 +483,14 @@ def run_offline_tracking(args, model, tracker, static_filter):
     target_w, target_h = (int(x) for x in args.target_res.split("x"))
     check_resolution((height, width), cfg_res=(target_w, target_h))
 
+    # Noise filters (Metavision SDK)
+    act_filter = (ActivityNoiseFilterAlgorithm(width, height, args.activity_filter_us)
+                  if args.activity_filter_us > 0 else None)
+    trail_filter = (TrailFilterAlgorithm(width, height, args.trail_filter_us)
+                    if args.trail_filter_us > 0 else None)
+    filter_buf = (ActivityNoiseFilterAlgorithm.get_empty_output_buffer()
+                  if act_filter is not None or trail_filter is not None else None)
+
     blank_score_map = np.zeros((height, width), dtype=np.float32)
     frame_period = 1.0 / max(args.display_fps, 1)
 
@@ -487,6 +517,8 @@ def run_offline_tracking(args, model, tracker, static_filter):
                     stop_event.set(); break
 
                 frame_idx += 1
+                # Apply Metavision SDK noise filters before model
+                events = filter_events(events, act_filter, trail_filter, filter_buf)
                 if len(events) == 0:
                     canvas = render_frame(empty_viz_events(), blank_score_map, latest_foreground_mask,
                                           current_tracks, height, width,
@@ -563,9 +595,18 @@ def main():
     target_w, target_h = (int(x) for x in args.target_res.split("x"))
     check_resolution((height, width), cfg_res=(target_w, target_h))
 
+    # Noise filters (Metavision SDK)
+    act_filter = (ActivityNoiseFilterAlgorithm(width, height, args.activity_filter_us)
+                  if args.activity_filter_us > 0 else None)
+    trail_filter = (TrailFilterAlgorithm(width, height, args.trail_filter_us)
+                    if args.trail_filter_us > 0 else None)
+    filter_buf = (ActivityNoiseFilterAlgorithm.get_empty_output_buffer()
+                  if act_filter is not None or trail_filter is not None else None)
+
     print(f"Camera: {width}x{height} -> model: {target_w}x{target_h}  |  window: {args.window_us} us  |  "
           f"detect-every: {args.detect_every}  |  max-events: {args.max_events}  |  "
           f"FP16: {args.fp16}  |  debug: {args.debug}")
+    print(f"Noise filter: activity={args.activity_filter_us}us trail={args.trail_filter_us}us")
     print(f"Adaptive threshold: search={args.score_thresh_low}  "
           f"track={args.score_thresh_high}  |  EMA: {args.score_ema}")
     print(f"Static filter: {args.static_thresh} frames  |  "
@@ -618,6 +659,7 @@ def main():
                 if has_new_events:
                     last_events_seq = events_seq
                     frame_idx += 1
+                    events = filter_events(events, act_filter, trail_filter, filter_buf)
                     current_viz_events = empty_viz_events() if len(events) == 0 else None
 
                 if closed and not has_new_events:
