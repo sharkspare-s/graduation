@@ -103,9 +103,10 @@ class SparseBasicBlock(spconv.SparseModule):
         return out
 
 class evspsegnet(nn.Module):
-    def __init__(self,cfg):
+    def __init__(self,cfg, use_patch_attention=True):
         super().__init__()
 
+        self.use_patch_attention = use_patch_attention
         input_channels = cfg.input_channel
         width=cfg.width
 
@@ -201,11 +202,14 @@ class evspsegnet(nn.Module):
         x = self.conv_input(input)
         x_conv1 = self.conv1(x)
         x_conv2 = self.conv2(x_conv1)
-        x_conv2 = self.pa2(x_conv2)
+        if self.use_patch_attention:
+            x_conv2 = self.pa2(x_conv2)
         x_conv3 = self.conv3(x_conv2)
-        x_conv3 = self.pa3(x_conv3)
+        if self.use_patch_attention:
+            x_conv3 = self.pa3(x_conv3)
         x_conv4 = self.conv4(x_conv3)
-        x_conv4 = self.pa4(x_conv4)
+        if self.use_patch_attention:
+            x_conv4 = self.pa4(x_conv4)
 
         x_up4 = self.UR_block_forward(x_conv4, x_conv4, self.conv_up_t4, self.conv_up_m4, self.inv_conv4)
         x_up3 = self.UR_block_forward(x_conv3, x_up4, self.conv_up_t3, self.conv_up_m3, self.inv_conv3)

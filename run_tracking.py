@@ -49,9 +49,9 @@ def parse_args():
                         help="Model target resolution WxH (events scaled from camera res to this)")
 
     # --- noise filters (Metavision SDK CV) ----------------------------------
-    parser.add_argument("--activity-filter-us", default=10000, type=int,
+    parser.add_argument("--activity-filter-us", default=0, type=int,
                         help="Activity noise filter window [us] (0 to disable)")
-    parser.add_argument("--trail-filter-us", default=1000, type=int,
+    parser.add_argument("--trail-filter-us", default=0, type=int,
                         help="Trail/hot-pixel filter window [us] (0 to disable)")
 
     # --- detection thresholds (adaptive) -----------------------------------
@@ -121,7 +121,7 @@ def build_model(cfg, config_path: str, checkpoint_path: str, use_fp16: bool = Fa
     finally:
         sys.argv = old_argv
 
-    model = evspsegnet(cfg).cuda().eval()
+    model = evspsegnet(cfg, use_patch_attention=False).cuda().eval()
     if use_fp16:
         model = model.half()
 
